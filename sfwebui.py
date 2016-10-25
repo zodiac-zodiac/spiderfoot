@@ -1,529 +1,720 @@
-#-----------------------------------------------------------------
-# Name:         sfwebui
-# Purpose:      User interface class for use with a web browser
-#
-# Author:       Steve Micallef <steve@binarypool.com>
-#
-# Created:      30/09/2012
-# Copyright:    (c) Steve Micallef 2012
-# License:      GPL
-#-----------------------------------------------------------------
-import json
-import threading
-import thread
-import cherrypy
-import cgi
-import csv
-import os
-import time
-import random
-import urllib2
-import re
-from copy import deepcopy
-from mako.lookup import TemplateLookup
-from mako.template import Template
-from sfdb import SpiderFootDb
-from sflib import SpiderFoot, globalScanStatus
-from sfscan import SpiderFootScanner
-from StringIO import StringIO
-
-class SpiderFootWebUi:
-    lookup = TemplateLookup(directories=[''])
-    defaultConfig = dict()
-    config = dict()
-    token = None
-
-    def __init__(self, config):
-        self.defaultConfig = deepcopy(config)
-        dbh = SpiderFootDb(self.defaultConfig)
-        # 'config' supplied will be the defaults, let's supplement them
-        # now with any configuration which may have previously been
-        # saved.
-        sf = SpiderFoot(self.defaultConfig)
-        self.config = sf.configUnserialize(dbh.configGet(), self.defaultConfig)
-
-        if self.config['__webaddr'] == "0.0.0.0":
-            addr = "<IP of this host>"
-        else:
-            addr = self.config['__webaddr']
-
-        print ""
-        print ""
-        print "*************************************************************"
-        print " Use SpiderFoot by starting your web browser of choice and "
-        print " browse to http://" + addr + ":" + str(self.config['__webport'])
-        print "*************************************************************"
-        print ""
-        print ""
+from ctypes import CFUNCTYPE, POINTER, cast, memmove, create_string_buffer
+from ctypes import c_int, c_long, c_char_p, c_void_p, c_longlong
 
 
-    # Sanitize user input
-    def cleanUserInput(self, inputList):
-        ret = list()
+AFUNPTR = CFUNCTYPE(None)
+TRACE_BUFFER_CALLBACK = CFUNCTYPE(c_void_p, c_int, c_int, c_void_p,
+                                  c_void_p, c_longlong, c_void_p)
+ROOT_THREAD_FUNC = CFUNCTYPE(None, c_void_p)
 
-        for item in inputList:
-            c = cgi.escape(item, True)
-            c = c.replace('\'', '&quot;')
-            ret.append(c)
 
-        return ret
+def read_ptr(addr):
+    """Read a pointer at a given address."""
+    return cast(addr, POINTER(c_long)).contents.value
 
-    def searchBase(self, id=None, eventType=None, value=None):
-        regex = ""
-        if [id, eventType, value].count('') == 2 or \
-            [id, eventType, value].count(None) == 2:
-            return None
 
-        if value.startswith("/") and value.endswith("/"):
-            regex = value[1:len(value)-1]
-            value = ""
+def read_str(addr):
+    """Read a zero-terminated string from memory."""
+    return cast(addr, c_char_p).value
 
-        value = value.replace('*', '%')
-        if value in [ None, "" ] and regex in [ None, "" ]:
-            value = "%"
-            regex = ""
 
-        dbh = SpiderFootDb(self.config)
-        criteria = {
-            'scan_id': None if id == '' else id,
-            'type': None if eventType == '' else eventType,
-            'value': None if value == '' else value,
-            'regex': None if regex == '' else regex
-        }
-        data = dbh.search(criteria)
-        retdata = []
-        for row in data:
-            lastseen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[0]))
-            escapeddata = cgi.escape(row[1])
-            escapedsrc = cgi.escape(row[2])
-            retdata.append([lastseen, escapeddata, escapedsrc,
-                row[3], row[5], row[6], row[7], row[8], row[10], row[11], row[4]])
+def read_mem(addr, size):
+    """Read a chunk of memory."""
+    buf = create_string_buffer(size)
+    memmove(buf, addr, size)
+    return buf.raw
 
-        return retdata
 
-    #
-    # USER INTERFACE PAGES
-    #
+# function with void return value
+def _v(*args):
+    return CFUNCTYPE(None, *args)
 
-    # Get result data in CSV format
-    def scaneventresultexport(self, id, type, dialect="excel"):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanResultEvent(id, type)
-        fileobj = StringIO()
-        parser = csv.writer(fileobj, dialect=dialect)
-        parser.writerow(["Updated", "Type", "Module", "Source", "Data"])
-        for row in data:
-            lastseen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[0]))
-            datafield = str(row[1]).replace("<SFURL>", "").replace("</SFURL>", "")
-            parser.writerow([lastseen, str(row[4]), str(row[3]), str(row[2]), datafield])
-        cherrypy.response.headers['Content-Disposition'] = "attachment; filename=SpiderFoot.csv"
-        cherrypy.response.headers['Content-Type'] = "application/csv"
-        cherrypy.response.headers['Pragma'] = "no-cache"
-        return fileobj.getvalue()
-    scaneventresultexport.exposed = True
 
-    # Get search result data in CSV format
-    def scansearchresultexport(self, id, eventType=None, value=None, dialect="excel"):
-        data = self.searchBase(id, eventType, value)
-        fileobj = StringIO()
-        parser = csv.writer(fileobj, dialect=dialect)
-        parser.writerow(["Updated", "Type", "Module", "Source", "Data"])
-        for row in data:
-            datafield = str(row[1]).replace("<SFURL>", "").replace("</SFURL>", "")
-            parser.writerow([row[0], str(row[10]), str(row[3]), str(row[2]), datafield])
-        cherrypy.response.headers['Content-Disposition'] = "attachment; filename=SpiderFoot.csv"
-        cherrypy.response.headers['Content-Type'] = "application/csv"
-        cherrypy.response.headers['Pragma'] = "no-cache"
-        return fileobj.getvalue()
-    scansearchresultexport.exposed = True
+# function with void pointer as return value
+def _vp(*args):
+    return CFUNCTYPE(c_void_p, *args)
 
-    # Configuration used for a scan
-    def scanopts(self, id):
-        ret = dict()
-        dbh = SpiderFootDb(self.config)
-        ret['config'] = dbh.scanConfigGet(id)
-        ret['configdesc'] = dict()
-        for key in ret['config'].keys():
-            if ':' not in key:
-                ret['configdesc'][key] = self.config['__globaloptdescs__'][key]
-            else:
-                [ modName, modOpt ] = key.split(':')
-                if not modName in self.config['__modules__'].keys():
-                    continue
 
-                if not modOpt in self.config['__modules__'][modName]['optdescs'].keys():
-                    continue
+# function with integer (or address, for that matter) return value
+def _i(*args):
+    return CFUNCTYPE(c_int, *args)
 
-                ret['configdesc'][key] = self.config['__modules__'][modName]['optdescs'][modOpt]
 
-        sf = SpiderFoot(self.config)
-        meta = dbh.scanInstanceGet(id)
-        if meta[3] != 0:
-            started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(meta[3]))
-        else:
-            started = "Not yet"
+# function with string return value
+def _s(*args):
+    return CFUNCTYPE(c_char_p, *args)
 
-        if meta[4] != 0:
-            finished = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(meta[4]))
-        else:
-            finished = "Not yet"
-        ret['meta'] = [meta[0], meta[1], meta[2], started, finished, meta[5]]
 
-        return json.dumps(ret)
-    scanopts.exposed = True
+# we have to make sure callback functions are not garbage collected
+_gc = []
 
-    # Configure a new scan
-    def newscan(self):
-        dbh = SpiderFootDb(self.config)
-        types = dbh.eventTypes()
-        templ = Template(filename='dyn/newscan.tmpl', lookup=self.lookup)
-        return templ.render(pageid='NEWSCAN', types=types, 
-            modules=self.config['__modules__'])
-    newscan.exposed = True
+# pin function declarations - functions which start with an underscore
+# get special treatment, e.g., they take a callback function
 
-    # Main page listing scans available
+# IMG
+IMG_Next = _i(c_int)
+IMG_Prev = _i(c_int)
+IMG_Invalid = _i()
+IMG_Valid = _i(c_int)
+IMG_SecHead = _i(c_int)
+IMG_SecTail = _i(c_int)
+IMG_RegsymHead = _i(c_int)
+IMG_Entry = _i(c_int)
+IMG_Name = _s(c_int)
+IMG_Gp = _i(c_int)
+IMG_LoadOffset = _i(c_int)
+IMG_LowAddress = _i(c_int)
+IMG_HighAddress = _i(c_int)
+IMG_StartAddress = _i(c_int)
+IMG_SizeMapped = _i(c_int)
+IMG_Type = _i(c_int)
+IMG_IsMainExecutable = _i(c_int)
+IMG_IsStaticExecutable = _i(c_int)
+IMG_Id = _i(c_int)
+IMG_FindImgById = _i(c_int)
+IMG_FindByAddress = _i(c_int)
+IMG_Open = _i(c_char_p)
+IMG_Close = _v(c_int)
+
+# APP
+APP_ImgHead = _i()
+APP_ImgTail = _i()
+
+# RTN
+RTN_Sec = _i(c_int)
+RTN_Next = _i(c_int)
+RTN_Prev = _i(c_int)
+RTN_Invalid = _i()
+RTN_Valid = _i(c_int)
+RTN_Name = _s(c_int)
+RTN_Sym = _i(c_int)
+RTN_Funptr = _i(c_int)
+RTN_Id = _i(c_int)
+RTN_Range = _i(c_int)
+RTN_Size = _i(c_int)
+RTN_FindNameByAddress = _s(c_int)
+RTN_FindByAddress = _i(c_int)
+RTN_FindByName = _i(c_int, c_char_p)
+RTN_Open = _v(c_int)
+RTN_Close = _v(c_int)
+RTN_InsHead = _i(c_int)
+RTN_InsHeadOnly = _i(c_int)
+RTN_InsTail = _i(c_int)
+RTN_NumIns = _i(c_int)
+_RTN_InsertCall = _v(c_int, c_int, AFUNPTR)
+RTN_Address = _i(c_int)
+RTN_CreateAt = _i(c_int, c_char_p)
+_RTN_Replace = CFUNCTYPE(AFUNPTR, c_int, AFUNPTR)
+
+# SEC
+SEC_Img = _i(c_int)
+SEC_Next = _i(c_int)
+SEC_Prev = _i(c_int)
+SEC_Invalid = _i()
+SEC_Valid = _i(c_int)
+SEC_RtnHead = _i(c_int)
+SEC_RtnTail = _i(c_int)
+SEC_Name = _s(c_int)
+SEC_Type = _i(c_int)
+SEC_Mapped = _i(c_int)
+SEC_Data = _vp(c_int)
+SEC_Address = _i(c_int)
+SEC_IsReadable = _i(c_int)
+SEC_IsWriteable = _i(c_int)
+SEC_IsExecutable = _i(c_int)
+SEC_Size = _i(c_int)
+
+# TRACE
+_TRACE_InsertCall = _v(c_int, c_int, AFUNPTR)
+TRACE_BblHead = _i(c_int)
+TRACE_BblTail = _i(c_int)
+TRACE_Original = _i(c_int)
+TRACE_Address = _i(c_int)
+TRACE_Size = _i(c_int)
+TRACE_Rtn = _i(c_int)
+TRACE_HasFallThrough = _i(c_int)
+TRACE_NumBbl = _i(c_int)
+TRACE_NumIns = _i(c_int)
+TRACE_StubSize = _i(c_int)
+
+# BBL
+BBL_MoveAllAttributes = _v(c_int, c_int)
+BBL_NumIns = _i(c_int)
+BBL_InsHead = _i(c_int)
+BBL_InsTail = _i(c_int)
+BBL_Next = _i(c_int)
+BBL_Prev = _i(c_int)
+BBL_Valid = _i(c_int)
+BBL_Original = _i(c_int)
+BBL_Address = _i(c_int)
+BBL_Size = _i(c_int)
+_BBL_InsertCall = _v(c_int, c_int, AFUNPTR)
+BBL_HasFallThrough = _i(c_int)
+
+# INS Instrumentation
+_INS_InsertCall = _v(c_int, c_int)
+
+# INS Generic Inspection
+INS_Category = _i(c_int)
+INS_Extension = _i(c_int)
+INS_MemoryOperandSize = _i(c_int, c_int)
+INS_MemoryWriteSize = _i(c_int)
+INS_GetPredicate = _i(c_int)
+INS_MemoryReadSize = _i(c_int)
+INS_IsMemoryRead = _i(c_int)
+INS_IsMemoryWrite = _i(c_int)
+INS_HasMemoryRead2 = _i(c_int)
+INS_HasFallThrough = _i(c_int)
+INS_IsLea = _i(c_int)
+INS_IsNop = _i(c_int)
+OPCODE_StringShort = _s(c_int)
+INS_Mnemonic = _s(c_int)
+INS_IsBranch = _i(c_int)
+INS_IsDirectBranch = _i(c_int)
+INS_IsDirectCall = _i(c_int)
+INS_IsDirectBranchOrCall = _i(c_int)
+INS_IsBranchOrCall = _i(c_int)
+INS_Stutters = _i(c_int)
+INS_IsCall = _i(c_int)
+INS_IsProcedureCall = _i(c_int)
+INS_IsRet = _i(c_int)
+INS_IsSysret = _i(c_int)
+INS_IsPrefetch = _i(c_int)
+INS_IsAtomicUpdate = _i(c_int)
+INS_IsIndirectBranchOrCall = _i(c_int)
+INS_RegR = _i(c_int)
+INS_RegW = _i(c_int)
+INS_Opcode = _i(c_int)
+CATEGORY_StringShort = _s(c_int)
+EXTENSION_StringShort = _s(c_int)
+INS_MaxNumRRegs = _i(c_int)
+INS_MaxNumWRegs = _i(c_int)
+INS_RegRContain = _i(c_int, c_int)
+INS_RegWContain = _i(c_int, c_int)
+INS_IsStackRead = _i(c_int)
+INS_IsStackWrite = _i(c_int)
+INS_IsIpRelRead = _i(c_int)
+INS_IsIpRelWrite = _i(c_int)
+# INS_IsPredicated = _i(c_int)
+INS_IsOriginal = _i(c_int)
+INS_Disassemble = _s(c_int)
+INS_MemoryOperandCount = _i(c_int)
+INS_OperandIsAddressGenerator = _i(c_int, c_int)
+INS_MemoryOperandIsRead = _i(c_int, c_int)
+INS_MemoryOperandIsWritten = _i(c_int, c_int)
+INS_IsSyscall = _i(c_int)
+INS_SyscallStd = _i(c_int)
+INS_Rtn = _i(c_int)
+INS_Next = _i(c_int)
+INS_Prev = _i(c_int)
+INS_Invalid = _i()
+INS_Valid = _i(c_int)
+INS_Address = _i(c_int)
+INS_Size = _i(c_int)
+INS_DirectBranchOrCallTargetAddress = _i(c_int)
+INS_NextAddress = _i(c_int)
+
+# INS ia32/intel64 Inspection TODO
+
+# INS Modification
+INS_InsertIndirectJump = _v(c_int, c_int, c_int)
+INS_InsertDirectJump = _v(c_int, c_int, c_int)
+INS_Delete = _v(c_int)
+
+# SYM
+SYM_Next = _i(c_int)
+SYM_Prev = _i(c_int)
+SYM_Name = _s(c_int)
+SYM_Invalid = _i()
+SYM_Valid = _i(c_int)
+SYM_Dynamic = _i(c_int)
+SYM_IFunc = _i(c_int)
+SYM_Value = _i(c_int)
+SYM_Index = _i(c_int)
+SYM_Address = _i(c_int)
+PIN_UndecorateSymbolName = _s(c_char_p, c_int)
+
+# Controlling and Initializing
+PIN_VmFullPath = _s()
+PIN_SafeCopy = _i(c_void_p, c_void_p, c_int)
+
+# Fast Buffering
+_PIN_DefineTraceBuffer = _i(c_int, c_int, TRACE_BUFFER_CALLBACK, c_void_p)
+PIN_AllocateBuffer = _vp(c_int)
+PIN_DeallocateBuffer = _v(c_int, c_void_p)
+PIN_GetBufferPointer = _vp(c_void_p, c_int)
+
+# Pin Process
+PIN_IsProcessExiting = _i()
+PIN_ExitProcess = _v(c_int)
+PIN_GetPid = _i()
+PIN_ExitApplication = _v(c_int)
+
+# Pin Thread
+PIN_GetTid = _i()
+PIN_ThreadId = _i()
+PIN_ThreadUid = _i()
+PIN_GetParentTid = _i()
+PIN_Sleep = _v(c_int)
+PIN_Yield = _v()
+_PIN_SpawnInternalThread = _i(ROOT_THREAD_FUNC, c_void_p,
+                              c_int, POINTER(c_int))
+PIN_ExitThread = _v(c_int)
+PIN_IsApplicationThread = _i()
+PIN_WaitForThreadTermination = _i(c_void_p, c_int, POINTER(c_int))
+PIN_CreateThreadDataKey = _i(c_void_p)
+PIN_DeleteThreadDataKey = _i(c_int)
+PIN_SetThreadData = _i(c_int, c_void_p, c_int)
+PIN_GetThreadData = _vp(c_int, c_int)
+
+# Pin System Call
+PIN_SetSyscallArgument = _v(c_void_p, c_int, c_int, c_int)
+PIN_GetSyscallArgument = _i(c_void_p, c_int, c_int)
+PIN_SetSyscallNumber = _v(c_void_p, c_int, c_int)
+PIN_GetSyscallNumber = _i(c_void_p, c_int)
+PIN_GetSyscallReturn = _i(c_void_p, c_int)
+PIN_GetSyscallErrno = _i(c_void_p, c_int)
+
+# Context Manipulation
+PIN_SetContextReg = _v(c_void_p, c_int, c_int)
+PIN_GetContextReg = _i(c_void_p, c_int)
+PIN_SaveContext = _v(c_void_p, c_void_p)
+PIN_ExecuteAt = _v(c_void_p)
+
+# the following line(s) are actually not required,
+# but these are for the strict syntax checker(s)
+_pin_function_addr = globals()['_pin_function_addr']
+x86 = globals()['x86']
+x64 = globals()['x64']
+
+# not hacky at all!
+for _name, _decl in globals().items():
+    if not _name.lstrip('_') in _pin_function_addr:
+        continue
+
+    if _name.startswith('_'):
+        globals()[_name] = _decl(_pin_function_addr[_name[1:]])
+    else:
+        globals()[_name] = _decl(_pin_function_addr[_name])
+
+for _name in ('RTN', 'TRACE', 'BBL', 'INS'):
+    _helper = globals()['_' + _name + '_InsertCall']
+
+    def _insert_call(obj, action, cb, *args):
+        _insert_call_helper(_helper, obj, action, cb, args)
+
+    globals()[_name + '_InsertCall'] = _insert_call
+
+
+def _insert_call_helper(fn, obj, action, cb, args):
+    # first extract the amount of parameters that will be required
+    # by the callback function and make an according declaration for it
+    ret, off = 0, 0
+    while off < len(args):
+        ret += 1
+        off += 1 + _iarg_table.get(args[off], 0)
+
+    decl = CFUNCTYPE(None, *[c_long for _ in xrange(ret)])
+
+    cb = decl(cb)
+    args = args + (IARG_LAST,)
+    _gc.extend((cb, args))
+    fn(obj, action, cb, *args)
+
+
+# override functions which accept callback functions, because
+# they need some extra care
+def RTN_Replace(rtn, func):
+    func = AFUNPTR(func)
+    _gc.append(func)
+    _RTN_Replace(rtn, func)
+
+
+def PIN_DefineTraceBuffer(record_size, num_pages, cb, arg):
+    cb = TRACE_BUFFER_CALLBACK(cb)
+    _gc.extend((cb, arg))
+    _PIN_DefineTraceBuffer(record_size, num_pages, cb, arg)
+
+
+def PIN_SpawnInternalThread(cb, arg, stack_size, thread_uid):
+    cb = ROOT_THREAD_FUNC(cb)
+    _gc.extend((cb, arg, thread_uid))
+    _PIN_SpawnInternalThread(cb, arg, stack_size, thread_uid)
+
+_iota_index, _iota_value, _iota_iter = 0, 0, lambda idx, val: idx + 1
+
+
+def iota(num=None, it=None):
+    """Returns an incremental number every iteration.
+
+    This is a trimmed down version of Go's iota keyword.
+    """
+    global _iota_index, _iota_value, _iota_iter
+
+    if not it is None:
+        _iota_iter = it
+
+    if not num is None:
+        _iota_value = num
+        _iota_index = 0
+    else:
+        _iota_value = _iota_iter(_iota_index, _iota_value)
+        _iota_index += 1
+
+    return _iota_value
+
+
+_iarg_table = {
+    IARG_ADDRINT: 1, IARG_PTR: 1, IARG_BOOL: 1, IARG_UINT32: 1,
+    IARG_REG_VALUE: 1, IARG_RETURN_REGS: 1,
+}
+
+
+class Instruction(object):
+    def __init__(self, ins):
+        self.ins = ins
+
+    @property
+    def valid(self):
+        return INS_Valid(self.ins)
+
+    @property
+    def addr(self):
+        return INS_Address(self.ins)
+
+    @property
+    def size(self):
+        return INS_Size(self.ins)
+
+    @property
+    def next_addr(self):
+        return INS_NextAddress(self.ins)
+
+    @property
+    def routine(self):
+        return Routine(INS_Rtn(self.ins))
+
+    @property
+    def disasm(self):
+        return INS_Disassemble(self.ins)
+
+    @property
+    def target(self):
+        return INS_DirectBranchOrCallTargetAddress(self.ins)
+
+
+class BasicBlock(object):
+    def __init__(self, bbl):
+        self.bbl = bbl
+
+    @property
+    def valid(self):
+        return BBL_Valid(self.bbl)
+
+    @property
+    def original(self):
+        return BBL_Original(self.bbl)
+
+    @property
+    def addr(self):
+        return BBL_Address(self.bbl)
+
+    @property
+    def size(self):
+        return BBL_Size(self.bbl)
+
+    @property
+    def fall_through(self):
+        return BBL_HasFallThrough(self.bbl)
+
+    @property
+    def num_ins(self):
+        return BBL_NumIns(self.bbl)
+
+    @property
+    def insns(self):
+        return _Iter(typ=Instruction, start=lambda: BBL_InsHead(self.bbl),
+                     end=lambda: BBL_InsTail(self.bbl), it=INS_Next)
+
+
+class Trace(object):
+    def __init__(self, trc):
+        self.trc = trc
+
+    @property
+    def original(self):
+        return TRACE_Original(self.trc)
+
+    @property
+    def addr(self):
+        return TRACE_Address(self.trc)
+
+    @property
+    def size(self):
+        return TRACE_Size(self.trc)
+
+    @property
+    def routine(self):
+        return Routine(TRACE_Rtn(self.trc))
+
+    @property
+    def fall_through(self):
+        return TRACE_HasFallThrough(self.trc)
+
+    @property
+    def bbls(self):
+        return _Iter(typ=BasicBlock, start=lambda: TRACE_BblHead(self.trc),
+                     end=lambda: TRACE_BblTail(self.trc), it=BBL_Next)
+
+    @property
+    def num_bbl(self):
+        return TRACE_NumBbl(self.trc)
+
+    @property
+    def num_ins(self):
+        return TRACE_NumIns(self.trc)
+
+    @property
+    def stub_size(self):
+        return TRACE_StubSize(self.trc)
+
+
+class Symbol(object):
+    def __init__(self, sym):
+        self.sym = sym
+
+    @property
+    def name(self):
+        return SYM_Name(self.sym)
+
+    @property
+    def valid(self):
+        return SYM_Valid(self.sym)
+
+    @property
+    def dynamic(self):
+        return SYM_Dynamic(self.sym)
+
+    @property
+    def ifunc(self):
+        return SYM_IFunc(self.sym)
+
+    @property
+    def value(self):
+        return SYM_Value(self.sym)
+
+    @property
     def index(self):
-        # Look for referenced templates in the current directory only
-        templ = Template(filename='dyn/scanlist.tmpl', lookup=self.lookup)
-        return templ.render(pageid='SCANLIST')
-    index.exposed = True
+        return SYM_Index(self.sym)
 
-    # Information about a selected scan
-    def scaninfo(self, id):
-        dbh = SpiderFootDb(self.config)
-        res = dbh.scanInstanceGet(id)
-        if res == None:
-            return self.error("Scan ID not found.")
+    @property
+    def addr(self):
+        return SYM_Address(self.sym)
 
-        templ = Template(filename='dyn/scaninfo.tmpl', lookup=self.lookup)
-        return templ.render(id=id, name=res[0], status=res[5], 
-            pageid="SCANLIST")
-    scaninfo.exposed = True
 
-    # Settings
-    def opts(self):
-        templ = Template(filename='dyn/opts.tmpl', lookup=self.lookup)
-        self.token = random.randint(0, 99999999)
-        return templ.render(opts=self.config, pageid='SETTINGS', token=self.token)
-    opts.exposed = True
-
-    # Generic error, but not exposed as not called directly
-    def error(self, message):
-        templ = Template(filename='dyn/error.tmpl', lookup=self.lookup)
-        return templ.render(message=message)
-
-    # Delete a scan
-    def scandelete(self, id, confirm=None):
-        dbh = SpiderFootDb(self.config)
-        res = dbh.scanInstanceGet(id)
-        if res == None:
-            return self.error("Scan ID not found.")
-
-        if confirm != None:
-            dbh.scanInstanceDelete(id)
-            raise cherrypy.HTTPRedirect("/")
+class Routine(object):
+    def __init__(self, rtn=None, addr=None):
+        if not addr is None:
+            self.rtn = RTN_FindByAddress(addr)
         else:
-            templ = Template(filename='dyn/scandelete.tmpl', lookup=self.lookup)
-            return templ.render(id=id, name=res[0], pageid="SCANLIST")
-    scandelete.exposed = True
+            self.rtn = rtn
 
-    # Save settings, also used to completely reset them to default
-    def savesettings(self, allopts, token):
-        if str(token) != str(self.token):
-            return self.error("Invalid token (" + str(self.token) + ").")
+    @property
+    def name(self):
+        return RTN_Name(self.rtn)
 
-        try:
-            dbh = SpiderFootDb(self.config)
-            # Reset config to default
-            if allopts == "RESET":
-                dbh.configClear() # Clear it in the DB
-                self.config = deepcopy(self.defaultConfig) # Clear in memory
-            else:
-                useropts = json.loads(allopts)
-                cleanopts = dict()
-                for opt in useropts.keys():
-                    cleanopts[opt] = self.cleanUserInput([useropts[opt]])[0]
+    @property
+    def valid(self):
+        return RTN_Valid(self.rtn)
 
-                currentopts = deepcopy(self.config)
+    @property
+    def symbol(self):
+        return RTN_Sym(self.rtn)
 
-                # Make a new config where the user options override
-                # the current system config.
-                sf = SpiderFoot(self.config)
-                self.config = sf.configUnserialize(cleanopts, currentopts)
-                dbh.configSet(sf.configSerialize(currentopts))
-        except Exception as e:
-            return self.error("Processing one or more of your inputs failed: " + str(e))
+    @property
+    def range(self):
+        return RTN_Range(self.rtn)
 
-        templ = Template(filename='dyn/opts.tmpl', lookup=self.lookup)
-        self.token = random.randint(0, 99999999)
-        return templ.render(opts=self.config, pageid='SETTINGS', updated=True, 
-            token=self.token)
-    savesettings.exposed = True
+    @property
+    def size(self):
+        return RTN_Size(self.rtn)
 
-    # Initiate a scan
-    def startscan(self, scanname, scantarget, modulelist, typelist):
-        global globalScanStatus
+    # TODO many more functions
 
-        # Snapshot the current configuration to be used by the scan
-        cfg = deepcopy(self.config)
-        modopts = dict() # Not used yet as module options are set globally
-        modlist = list()
-        sf = SpiderFoot(cfg)
-        dbh = SpiderFootDb(cfg)
-        types = dbh.eventTypes()
-        targetType = None
-        [scanname, scantarget] = self.cleanUserInput([scanname, scantarget])
 
-        if scanname == "" or scantarget == "":
-            return self.error("Form incomplete.")
+class Section(object):
+    def __init__(self, sec):
+        self.sec = sec
 
-        if typelist == "" and modulelist == "":
-            return self.error("Form incomplete.")
+    @property
+    def image(self):
+        return Image(SEC_Img(self.sec))
 
-        if modulelist != "":
-            modlist = modulelist.replace('module_', '').split(',')
+    @property
+    def valid(self):
+        return SEC_Valid(self.sec)
+
+    @property
+    def routines(self):
+        return _Iter(typ=Routine, start=lambda: SEC_RtnHead(self.sec),
+                     end=lambda: SEC_RtnTail(self.sec), it=RTN_Next)
+
+    @property
+    def name(self):
+        return SEC_Name(self.sec)
+
+    @property
+    def mapped(self):
+        return SEC_Mapped(self.sec)
+
+    @property
+    def data(self):
+        return SEC_Data(self.sec)
+
+    @property
+    def addr(self):
+        return SEC_Address(self.sec)
+
+    @property
+    def readable(self):
+        return SEC_IsReadable(self.sec)
+
+    @property
+    def writeable(self):
+        return SEC_IsWriteable(self.sec)
+
+    @property
+    def executable(self):
+        return SEC_IsExecutable(self.sec)
+
+    @property
+    def size(self):
+        return SEC_Size(self.sec)
+
+
+class Context(object):
+    _regs = dict((k[4:].lower(), v)
+                 for k, v in globals().items()
+                 if k.startswith('REG_'))
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def __getitem__(self, key):
+        return PIN_GetContextReg(self.ctx, self._regs[key])
+
+    def __setitem__(self, key, value):
+        PIN_SetContextReg(self.ctx, self._regs[key], value)
+
+    def __getattr__(self, name):
+        return PIN_GetContextReg(self.ctx, self._regs[name])
+
+    def __setattr__(self, name, value):
+        if not name in self._regs:
+            object.__setattr__(self, name, value)
         else:
-            typesx = typelist.replace('type_', '').split(',')
-            # 1. Find all modules that produce the requested types
-            modlist = sf.modulesProducing(typesx)
-            newmods = deepcopy(modlist)
-            newmodcpy = deepcopy(newmods)
-            # 2. For each type those modules consume, get modules producing
-            while len(newmodcpy) > 0:
-                for etype in sf.eventsToModules(newmodcpy):
-                    xmods = sf.modulesProducing([etype])
-                    for mod in xmods:
-                        if mod not in modlist:
-                            modlist.append(mod)
-                            newmods.append(mod)
-                newmodcpy = deepcopy(newmods)
-                newmods = list()
+            PIN_SetContextReg(self.ctx, self._regs[name], value)
 
-        # Add our mandatory storage module..
-        if "sfp__stor_db" not in modlist:
-            modlist.append("sfp__stor_db")
-        modlist.sort()
 
-        regexToType = {
-            "^\d+\.\d+\.\d+\.\d+$": "IP_ADDRESS",
-            "^\d+\.\d+\.\d+\.\d+/\d+$": "NETBLOCK_OWNER",
-            "^.[a-zA-Z\-0-9\.]+$": "INTERNET_NAME"
-        }
+class Image(object):
+    def __init__(self, img=None, addr=None):
+        if not addr is None:
+            self.img = IMG_FindByAddress(addr)
+        else:
+            self.img = img
 
-        # Parse the target and set the targetType
-        for rx in regexToType.keys():
-            if re.match(rx, scantarget, re.IGNORECASE):
-                targetType = regexToType[rx]
-                break
+    @staticmethod
+    def open(fname):
+        img = IMG_Open(fname)
+        return Image(img) if IMG_Valid(img) else None
 
-        if targetType == None:
-            return self.error("Invalid target type. Could not recognize it as " + \
-                "an IP address, IP subnet, domain name or host name.")
+    def close(self):
+        IMG_Close(self.img)
 
-        # Start running a new scan
-        scanId = sf.genScanInstanceGUID(scanname)
-        t = SpiderFootScanner(scanname, scantarget.lower(), targetType, scanId, 
-            modlist, cfg, modopts)
-        t.start()
+    @property
+    def name(self):
+        return IMG_Name(self.img)
 
-        # Wait until the scan has initialized
-        while globalScanStatus.getStatus(scanId) == None:
-            print "[info] Waiting for the scan to initialize..."
-            time.sleep(1)
+    @property
+    def valid(self):
+        return IMG_Valid(self.img)
 
-        templ = Template(filename='dyn/scaninfo.tmpl', lookup=self.lookup)
-        return templ.render(id=scanId, name=scanname, 
-            status=globalScanStatus.getStatus(scanId), pageid="SCANLIST")
-    startscan.exposed = True
+    @property
+    def low_addr(self):
+        return IMG_LowAddress(self.img)
 
-    # Stop a scan (id variable is unnecessary for now given that only one simultaneous
-    # scan is permitted.)
-    def stopscan(self, id):
-        global globalScanStatus
+    @property
+    def high_addr(self):
+        return IMG_HighAddress(self.img)
 
-        if globalScanStatus.getStatus(id) == None:
-            return self.error("That scan is not actually running. A data consistency " + \
-                "error for this scan probably exists. <a href='/scandelete?id=" + \
-                id + "&confirm=1'>Click here to delete it.</a>")
+    @property
+    def addr(self):
+        return self.low_addr, self.high_addr
 
-        if globalScanStatus.getStatus(id) == "ABORTED":
-            return self.error("The scan is already aborted.")
+    @property
+    def main(self):
+        return IMG_IsMainExecutable(self.img)
 
-        if not globalScanStatus.getStatus(id) == "RUNNING":
-            return self.error("The running scan is currently in the state '" + \
-                globalScanStatus.getStatus(id) + "', please try again later or restart " + \
-                " SpiderFoot.")
+    @property
+    def static(self):
+        return IMG_IsStaticExecutable(self.img)
 
-        globalScanStatus.setStatus(id, "ABORT-REQUESTED")
-        templ = Template(filename='dyn/scanlist.tmpl', lookup=self.lookup)
-        return templ.render(pageid='SCANLIST',stoppedscan=True)
-    stopscan.exposed = True
+    @property
+    def entry(self):
+        return IMG_Entry(self.img)
 
-    #
-    # DATA PROVIDERS
-    #
+    @property
+    def sections(self):
+        return _Iter(typ=Section, start=lambda: IMG_SecHead(self.img),
+                     end=lambda: IMG_SecTail(self.img), it=SEC_Next)
 
-    # Scan log data
-    def scanlog(self, id, limit=None):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanLogs(id, limit)
-        retdata = []
-        for row in data:
-            generated = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[0]/1000))
-            retdata.append([generated, row[1], row[2], 
-                cgi.escape(unicode(row[3], errors='replace'))])
-        return json.dumps(retdata)
-    scanlog.exposed = True
+    @property
+    def symbols(self):
+        return _Iter(typ=Symbol, start=lambda: IMG_RegsymHead(self.img),
+                     valid=SYM_Valid, it=SYM_Next)
 
-    # Scan error data
-    def scanerrors(self, id, limit=None):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanErrors(id, limit)
-        retdata = []
-        for row in data:
-            generated = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[0]/1000))
-            retdata.append([generated, row[1],
-                cgi.escape(unicode(row[2], errors='replace'))])
-        return json.dumps(retdata)
-    scanerrors.exposed = True
+    def routine(self, name):
+        rtn = RTN_FindByName(self.img, name)
+        return Routine(rtn) if RTN_Valid(rtn) else None
 
-    # Produce a list of scans
-    def scanlist(self):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanInstanceList()
-        retdata = []
-        for row in data:
-            created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[3]))
-            if row[4] != 0:
-                started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[4]))
-            else:
-                started = "Not yet"
 
-            if row[5] != 0:
-                finished = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[5]))
-            else:
-                finished = "Not yet"
-            retdata.append([row[0], row[1], row[2], created, started, finished, row[6], row[7]])
-        return json.dumps(retdata)
-    scanlist.exposed = True
+class _Iter(object):
+    def __init__(self, typ=None, start=None, end=None, valid=None, it=None):
+        self.typ = typ
+        self.start = start
+        self.end = end
+        self.valid = valid
+        self.it = it
+        self.obj = None
 
-    # Basic information about a scan
-    def scanstatus(self, id):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanInstanceGet(id)
-        created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data[2]))
-        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data[3]))
-        ended = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data[4]))
+    def next(self):
+        if self.end and self.obj == self.end():
+            raise StopIteration
 
-        retdata = [data[0], data[1], created, started, ended, data[5]]
-        return json.dumps(retdata)
-    scanstatus.exposed = True
+        if self.obj is None:
+            self.obj = self.start()
+        else:
+            self.obj = self.it(self.obj)
 
-    # Summary of scan results
-    def scansummary(self, id):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanResultSummary(id)
-        retdata = []
-        for row in data:
-            lastseen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[2]))
-            retdata.append([row[0], row[1], lastseen, row[3], row[4]])
-        return json.dumps(retdata)
-    scansummary.exposed = True
+        if self.valid and not self.valid(self.obj):
+            raise StopIteration
 
-    # Event results for a scan
-    def scaneventresults(self, id, eventType):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanResultEvent(id, eventType)
-        retdata = []
-        for row in data:
-            lastseen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[0]))
-            escapeddata = cgi.escape(row[1])
-            escapedsrc = cgi.escape(row[2])
-            retdata.append([lastseen, escapeddata, escapedsrc, 
-                row[3], row[5], row[6], row[7], row[8]])
-        return json.dumps(retdata, ensure_ascii=False)
-    scaneventresults.exposed = True
+        return self.typ(self.obj)
 
-    # Unique event results for a scan
-    def scaneventresultsunique(self, id, eventType):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanResultEventUnique(id, eventType)
-        retdata = []
-        for row in data:
-            escaped = cgi.escape(row[0])
-            retdata.append([escaped, row[1], row[2]])
-        return json.dumps(retdata, ensure_ascii=False)
-    scaneventresultsunique.exposed = True
+    def __iter__(self):
+        # provide a new object for multi-threaded support
+        return _Iter(typ=self.typ, start=self.start, end=self.end,
+                     valid=self.valid, it=self.it)
 
-    # Search
-    def search(self, id=None, eventType=None, value=None):
-        retdata = self.searchBase(id, eventType, value)
-        return json.dumps(retdata, ensure_ascii=False)
-    search.exposed = True
+    def __getitem__(self, key):
+        # this is very expensive for larger sets.. but pretty flexible
+        return [obj for obj in self][key]
 
-    # Historical data for the scan, graphs will be rendered in JS
-    def scanhistory(self, id):
-        dbh = SpiderFootDb(self.config)
-        data = dbh.scanResultHistory(id)
-        return json.dumps(data, ensure_ascii=False)
-    scanhistory.exposed = True
 
-    def scanelementtypediscovery(self, id, eventType):
-        keepGoing = True
-        sf = SpiderFoot(self.config)
-        dbh = SpiderFootDb(self.config)
-        pc = dict()
-        datamap = dict()
+Images = _Iter(typ=Image, start=APP_ImgHead, end=APP_ImgTail, it=IMG_Next)
 
-        # Get the events we will be tracing back from
-        leafSet = dbh.scanResultEvent(id, eventType)
 
-        # Get the first round of source IDs for the leafs
-        nextIds = list()
-        for row in leafSet:
-            # these must be unique values!
-            parentId = row[9]
-            childId = row[8]
-            datamap[childId] = row
-
-            if pc.has_key(parentId):
-                if childId not in pc[parentId]:
-                    pc[parentId].append(childId)
-            else:
-                pc[parentId] = [ childId ]
-
-            # parents of the leaf set
-            if parentId not in nextIds:
-                nextIds.append(parentId)
-
-        while keepGoing:
-            parentSet = dbh.scanElementSources(id, nextIds)
-            nextIds = list()
-            keepGoing = False
-
-            for row in parentSet:
-                parentId = row[9]
-                childId = row[8]
-                datamap[childId] = row
-                #print childId + " = " + str(row)
-
-                if pc.has_key(parentId):
-                    if childId not in pc[parentId]:
-                        pc[parentId].append(childId)
-                else:
-                    pc[parentId] = [ childId ]
-                if parentId not in nextIds:
-                    nextIds.append(parentId)
-
-                # Prevent us from looping at root
-                if parentId != "ROOT":
-                    keepGoing = True
-
-        datamap[parentId] = row
-        # Delete the ROOT key as it adds no value from a viz perspective
-        del pc['ROOT']
-        retdata = dict()
-        retdata['tree'] = sf.dataParentChildToTree(pc)
-        retdata['data'] = datamap
-        return json.dumps(retdata, ensure_ascii=False)
-    scanelementtypediscovery.exposed = True
+# some helper functions which do all the hard work of casting the parameters
+# appropriately, until I find the correct way to do it directly natively
+def _callback_helper(cb, typ, obj):
+    return cb(typ(obj))
